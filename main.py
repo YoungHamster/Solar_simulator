@@ -1,29 +1,163 @@
-import time
-
+import math
+import numpy as np
 import matplotlib.pyplot as plt
 
+# выработка солнечного массива номинальной мощностью 1 квт от сайта https://pvwatts.nrel.gov/pvwatts.php без учёта сезонных наклонов панелей(с наклонами выработка будет выше)
 energy_generated_per_month = [32.4, 63, 109.9, 116.5, 153.6, 155.8, 158.7, 153.4, 93.4, 64, 18.4, 14.2]
 
 months = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь", "ноябрь",
           "декабрь"]
 
-kW_price_rub = 18900
-kWh_battery_price_rub = 7552
+kW_price_rub = 18100
+kWh_battery_price_rub = 6753
+bms_price_rub = 12819
 max_6kW_inverter_price_rub = 35707
 max_11kW_inverter_price_rub = 96328
 
-miners = [{'name':'antminer s21', 'price': 192000, 'power':3.5, 'profit/h':0.4975},
+# profit/h исчисляется в долларах
+miners = [{'name': 'antminer s21', 'price': 192000, 'power': 3.5, 'hashrate': 200},
           #{'name':'antminer s19k pro', 'price':80000, 'power':2.8, 'profit/h':0.2979},
           #{'name':'antminer s19 100th', 'price':31800, 'power':3.25, 'profit/h':0.2487},
           #{'name':'antminer z15 pro', 'price':190650, 'power':2.7, 'profit/h':0.4333},
           #{'name':'antminer s19j pro 92th', 'price':42454, 'power':2.5, 'profit/h':0.22885},
-          {'name':'antminer s19xp', 'price':103955, 'power':2.881, 'profit/h':0.3333}
+          {'name': 'antminer s19xp', 'price': 62000, 'power': 2.881, 'hashrate': 141},
+          {'name': 'innosilicon t2thf+', 'price': 8000, 'power': 2.2, 'hashrate': 33}
           ]
 
 dollar_price = 78.11
+usd_perhash_per24h = 0.0322
+
+solar_hours_avg_day = [2.5, 2.9, 4.5, 7.2, 9.8, 10.8, 11.2, 11.2, 8.5, 5.8, 4.2, 2.6]
+solar_days = [10, 9, 14, 20, 25, 26, 28, 29, 25, 20, 17, 11]
+days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+solar_day_length_avg = [8.5, 10, 12, 14, 15.66, 16.66, 16, 14.66, 12.66, 10.66, 9, 8]
 
 
-def calc_profit_metrics(energy_gen_by_month, miner_power, miner_profit_per_h_usd):
+def hourly_energy_approximation(
+        days_in_month,  # Число дней в каждом месяце (12)
+        sunny_days_in_month,  # Число солнечных дней (12)
+        avg_sun_hours_per_day,  # Среднее солнечных часов в день (12)
+        avg_energy_production,  # Средняя выработка энергии (12)
+        day_length,  # Длина светового дня (12)
+        cloud_efficiency=0.5,  # Эффективность в облака (0-1)
+        seed=None  # Seed для воспроизводимости
+):
+    """Аппроксимирует почасовую выработку солнечной энергии с учетом:
+    - Случайного распределения солнечных дней
+    - Колоколообразного профиля выработки
+    - Облачных дней с частичной эффективностью
+    - Сезонных изменений светового дня
+
+    Возвращает массив выработки энергии по часам для всего года"""
+
+    # Инициализация генератора случайных чисел
+    rng = np.random.default_rng(seed)
+
+    # Подготовка данных
+    total_days = sum(days_in_month)
+    result = np.zeros(total_days * 24)
+    day_start_index = 0
+
+    # Параметры колоколообразного распределения
+    PEAK_HOUR = 12.0  # Пик выработки в полдень
+    SIGMA_FACTOR = 5  # Коэффициент ширины колокола для солнечного дня
+
+    for month in range(12):
+        n_days = days_in_month[month]
+        n_sunny = sunny_days_in_month[month]
+        monthly_energy = avg_energy_production[month]
+        daylight = day_length[month]
+
+        # 1. Случайное распределение солнечных часов в месяце
+        sunny_hour_flags = np.zeros(n_days * 24, dtype=bool)
+        sunny_indices = rng.choice(n_days * 24, size=int(n_sunny * 24), replace=False)
+        sunny_hour_flags[sunny_indices] = True
+
+        # 3. Расчет профиля дня (колоколообразная кривая)
+        sun_energy_profile = np.zeros(24)
+
+        # Параметры нормального распределения
+        sigma = daylight / SIGMA_FACTOR
+        total_weight = 0
+        hour_weights = []
+
+        normal_distribution_factor = 1 / math.sqrt(2 * math.pi * sigma ** 2)
+        for hour in range(24):
+            hour_center = hour + 0.5
+            # Рассчитываем вес только в пределах светового дня
+            if abs(hour_center - PEAK_HOUR) <= daylight / 2:
+                weight_sunny = math.exp(-(hour_center - PEAK_HOUR) ** 2 / (2 * sigma ** 2))
+                weight_sunny = weight_sunny * normal_distribution_factor
+            else:
+                weight_sunny = 0
+
+            hour_weights.append(weight_sunny)
+            total_weight += weight_sunny
+
+        # Нормализуем и масштабируем веса
+        if total_weight > 0:
+            sun_energy_profile = np.array(hour_weights) / total_weight
+
+        # 4. Расчет энергии для солнечных и облачных дней
+        # Энергия на один час
+        monthly_energy_per_hour = monthly_energy / (
+                    n_sunny * daylight + (n_days - n_sunny) * daylight * cloud_efficiency)
+        sunny_effective_hours = n_sunny * daylight
+        cloudy_effective_hours = (n_days - n_sunny) * daylight * cloud_efficiency
+        energy_per_sunny_hour = (monthly_energy - monthly_energy_per_hour * cloudy_effective_hours) / sunny_effective_hours
+
+        print(f"monthly_energy_per_hour = {round(monthly_energy_per_hour, 2)}, sun_hours = {round(n_sunny*daylight, 0)}"
+              f", cloud_hours = {round((n_days - n_sunny) * daylight, 0)},"
+              f" effective hours = {round(n_sunny * daylight + (n_days - n_sunny) * daylight * cloud_efficiency, 0)}"
+              f" energy = {monthly_energy}")
+
+        # Для каждого дня в месяце
+        for day in range(n_days):
+            day_profile = sun_energy_profile * energy_per_sunny_hour
+
+            # Для каждого пасмурного часа уменьшаем значение сгенерированной энергии
+            for hour in range(24):
+                if not sunny_hour_flags[hour + day * 24]:
+                    day_profile[hour] = day_profile[hour] * cloud_efficiency
+            # Добавляем профиль дня к результату
+            start_idx = day_start_index + day * 24
+            end_idx = start_idx + 24
+            result[start_idx:end_idx] = day_profile
+
+        day_start_index += n_days * 24
+
+    return result
+
+
+# Вызов функции
+result = hourly_energy_approximation(
+    days,
+    solar_days,
+    solar_hours_avg_day,
+    energy_generated_per_month,
+    solar_day_length_avg
+)
+
+# Визуализация случайной недели
+day_index = 180  # Произвольный день
+start = day_index * 24
+end = start + 24
+
+plt.figure(figsize=(20, 6))
+plt.plot(result[start:end])
+plt.title(f"Почасовая выработка энергии (День {day_index})")
+plt.xlabel("Час дня")
+plt.ylabel("Выработка энергии")
+plt.grid(True)
+plt.show()
+
+month_production = [sum(result[sum(days[:i])*24: sum(days[:i+1])*24]) for i in range(12)]
+
+for i in range(12):
+    print(f"За мессяц {i} выработано {month_production[i]} квтч, относительно июля это {month_production[7] / month_production[i]}, ожидаемое соотношение: {energy_generated_per_month[7] / energy_generated_per_month[i]}")
+
+
+def calc_profit_metrics(energy_gen_by_month, main_miner, second_miner):
     solar_hours_avg_day = [2.5, 2.9, 4.5, 7.2, 9.8, 10.8, 11.2, 11.2, 8.5, 5.8, 4.2, 2.6]
     solar_days = [10, 9, 14, 20, 25, 26, 28, 29, 25, 20, 17, 11]
     days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
@@ -34,7 +168,6 @@ def calc_profit_metrics(energy_gen_by_month, miner_power, miner_profit_per_h_usd
     profit_with_battery = []
     profit_without_battery = []
     profit_with_second_miner = []
-    profit_with_without_battery = []
 
     for i in range(12):
         solar_hours = solar_hours_avg_day[i] * days[i]
@@ -45,20 +178,19 @@ def calc_profit_metrics(energy_gen_by_month, miner_power, miner_profit_per_h_usd
 
         energy_per_peak_hour = (kWh_sunny * peak_hour_power_share) / (solar_hours * peak_hour_share)
         excess_kWh = 0
-        if energy_per_peak_hour > miner_power:
-            excess_kWh = (energy_per_peak_hour - miner_power) * (solar_hours * peak_hour_share)
+        if energy_per_peak_hour > main_miner['power']:
+            excess_kWh = (energy_per_peak_hour - main_miner['power']) * (solar_hours * peak_hour_share)
 
         energy_per_off_peak_hour = (kWh_sunny * (1 - peak_hour_power_share)) / (solar_hours * (1 - peak_hour_share))
-        if energy_per_off_peak_hour > miner_power:
-            excess_kWh += (energy_per_off_peak_hour - miner_power) * (solar_hours * (1 - peak_hour_share))
+        if energy_per_off_peak_hour > main_miner['power']:
+            excess_kWh += (energy_per_off_peak_hour - main_miner['power']) * (solar_hours * (1 - peak_hour_share))
 
-        mining_hours_no_battery = (energy_gen_by_month[i] - excess_kWh) / miner_power
-        mining_hours_battery = energy_gen_by_month[i] / miner_power
+        mining_hours_no_battery = (energy_gen_by_month[i] - excess_kWh) / main_miner['power']
+        mining_hours_battery = energy_gen_by_month[i] / main_miner['power']
         if mining_hours_battery > days[i] * 24:
             mining_hours_battery = days[i] * 24
-        profit_no_battery = mining_hours_no_battery * miner_profit_per_h_usd * dollar_price
-        profit_battery = mining_hours_battery * miner_profit_per_h_usd * dollar_price
-        profit_with_without_battery.append([profit_battery, profit_no_battery])
+        profit_with_battery.append(mining_hours_battery * main_miner['profit/h'] * dollar_price)
+        profit_without_battery.append(mining_hours_no_battery * main_miner['profit/h'] * dollar_price)
 
     return profit_with_battery, profit_without_battery, profit_with_second_miner
 
@@ -69,9 +201,9 @@ def calc_roi_for_miner(miner, minkW, maxkW, steps):
     no_battery_system_price = []
     no_battery_roi = []
     battery_price = []
-    step = (maxkW-minkW)/steps
+    step = (maxkW - minkW) / steps
     for i in range(steps):
-        solar_kW = minkW + i*step
+        solar_kW = minkW + i * step
         (profit_with_without_battery_per_month, energy_per_peak_hour_per_month, sunny_hour_energy_share_per_month,
          excess_kWh_per_sunny_day_per_month) = calc_profit_metrics([x * solar_kW for x in energy_generated_per_month],
                                                                    miner['power'], miner['profit/h'])
@@ -104,7 +236,7 @@ def calc_roi_for_miner(miner, minkW, maxkW, steps):
             max_roi = battery_roi[i]
             max_index = i
     solar_price = (minkW + step * max_index) * kW_price_rub
-    print(miner['name'],'Max ROI:', max_roi, 'system price:', battery_system_price[max_index],
+    print(miner['name'], 'Max ROI:', max_roi, 'system price:', battery_system_price[max_index],
           'battery price:', battery_price[max_index], 'battery size:', battery_price[max_index] / kWh_battery_price_rub,
           'solar price:', solar_price, 'solar size:', solar_price / kW_price_rub,
           'miner price:', miner['price'],
@@ -112,33 +244,37 @@ def calc_roi_for_miner(miner, minkW, maxkW, steps):
 
     return no_battery_system_price, no_battery_roi, battery_system_price, battery_roi
 
-minkW = 4
-maxkW = 16
-steps = 60
-for miner in miners:
-    no_battery_price, no_battery_roi, battery_price, battery_roi = calc_roi_for_miner(miner, minkW, maxkW, steps)
-    miner['nbp'] = no_battery_price
-    miner['nbr'] = no_battery_roi
-    miner['bp'] = battery_price
-    miner['br'] = battery_roi
 
-fig = plt.figure(figsize=(12, 10))
-plt.subplot(2, 1, 1)
-for miner in miners:
-    plt.plot([minkW + i*((maxkW-minkW)/steps) for i in range(steps)], miner['bp'], label=miner['name']+'+batt')
-    plt.plot([minkW + i*((maxkW-minkW)/steps) for i in range(steps)], miner['nbp'], label=miner['name'])
-plt.xlabel('solar kW')
-plt.title('Стоимость системы')
+def graph_rois_by_miner():
+    minkW = 4
+    maxkW = 16
+    steps = 60
+    for miner in miners:
+        no_battery_price, no_battery_roi, battery_price, battery_roi = calc_roi_for_miner(miner, minkW, maxkW, steps)
+        miner['nbp'] = no_battery_price
+        miner['nbr'] = no_battery_roi
+        miner['bp'] = battery_price
+        miner['br'] = battery_roi
 
-plt.subplot(2, 1, 2)
-for miner in miners:
-    plt.plot([minkW + i*((maxkW-minkW)/steps) for i in range(steps)], miner['br'], label=miner['name']+'+batt')
-    plt.plot([minkW + i*((maxkW-minkW)/steps) for i in range(steps)], miner['nbr'], label=miner['name'])
-plt.xlabel('solar kW')
-plt.title('ROI')
+    fig = plt.figure(figsize=(12, 10))
+    plt.subplot(2, 1, 1)
+    for miner in miners:
+        plt.plot([minkW + i * ((maxkW - minkW) / steps) for i in range(steps)], miner['bp'],
+                 label=miner['name'] + '+batt')
+        plt.plot([minkW + i * ((maxkW - minkW) / steps) for i in range(steps)], miner['nbp'], label=miner['name'])
+    plt.xlabel('solar kW')
+    plt.title('Стоимость системы')
 
-plt.legend()
-plt.show()
+    plt.subplot(2, 1, 2)
+    for miner in miners:
+        plt.plot([minkW + i * ((maxkW - minkW) / steps) for i in range(steps)], miner['br'],
+                 label=miner['name'] + '+batt')
+        plt.plot([minkW + i * ((maxkW - minkW) / steps) for i in range(steps)], miner['nbr'], label=miner['name'])
+    plt.xlabel('solar kW')
+    plt.title('ROI')
+
+    plt.legend()
+    plt.show()
 
 
 def show_calc_profit_metrics(energy_gen_by_month, miner_power, miner_profit_per_h_usd):
@@ -176,4 +312,3 @@ def show_calc_profit_metrics(energy_gen_by_month, miner_power, miner_profit_per_
     plt.grid(axis='y')
 
     plt.show()
-
