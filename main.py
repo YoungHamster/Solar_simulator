@@ -30,6 +30,7 @@ miners = [{'name': 'antminer s21', 'price': 101000, 'power': 3.5, 'hashrate': 20
 
 dollar_price = 78.11
 usd_perhash_per24h = 0.0322
+battery_efficiency = 0.95
 
 solar_hours_avg_day = [2.5, 2.9, 4.5, 7.2, 9.8, 10.8, 11.2, 11.2, 8.5, 5.8, 4.2, 2.6]
 solar_days = [10, 9, 14, 20, 25, 26, 28, 29, 25, 20, 17, 11]
@@ -120,8 +121,6 @@ def hourly_energy_approximation(
 
 
 def calc_profit_for_year(energy_gen_by_hour, solar_kw, battery_kwh, miner):
-    battery_efficiency = 0.95
-
     effectively_storable_energy = 0
     generated_rub = []
     profit_per_hour = miner['hashrate'] * usd_perhash_per24h * dollar_price / 24
@@ -145,7 +144,85 @@ def calc_profit_for_year(energy_gen_by_hour, solar_kw, battery_kwh, miner):
 
     return sum(generated_rub)
 
-def find_best_payback(minkW, maxkW, minkWh, maxkWh, steps):
+
+# Strategy that powers on secondary miner every time there is excess energy
+def calc_profit_with_secondary_miner(energy_gen_by_hour, solar_kw, battery_kwh, miner, secondary_miner):
+    effectively_storable_energy = 0
+    generated_rub = []
+    profit_per_hour = miner['hashrate'] * usd_perhash_per24h * dollar_price / 24
+    sec_profit_per_hour = secondary_miner['hashrate'] * usd_perhash_per24h * dollar_price / 24
+    for energy in energy_gen_by_hour:
+        # рассчет энергии идёт для солнечных панелей номиналом 1квт,
+        # если у нас больше/меньше то необходимо включать множитель
+        generated_energy = energy * solar_kw
+        if generated_energy >= miner['power']:
+            if generated_energy >= miner['power'] + secondary_miner['power']:
+                generated_rub.append(profit_per_hour + sec_profit_per_hour)
+
+                effectively_storable_energy += (generated_energy - miner['power'] - secondary_miner['power']) * battery_efficiency
+                if effectively_storable_energy > battery_kwh: effectively_storable_energy = battery_kwh
+            else:
+                effectively_storable_energy += (generated_energy - miner['power']) * battery_efficiency
+                if effectively_storable_energy > battery_kwh: effectively_storable_energy = battery_kwh
+                if effectively_storable_energy < secondary_miner['power']:
+                    secondary_miner_time = effectively_storable_energy / secondary_miner['power']
+                    generated_rub.append(profit_per_hour + secondary_miner_time * sec_profit_per_hour)
+                    effectively_storable_energy = 0
+                else:
+                    generated_rub.append(profit_per_hour + sec_profit_per_hour)
+                    effectively_storable_energy -= miner['power'] + secondary_miner['power']
+        else:
+            if effectively_storable_energy + generated_energy >= miner['power'] + secondary_miner['power']:
+                generated_rub.append(profit_per_hour + sec_profit_per_hour)
+                effectively_storable_energy -= miner['power'] + secondary_miner['power'] - generated_energy
+            elif effectively_storable_energy + generated_energy >= miner['power']:
+                generated_rub.append(profit_per_hour)
+                effectively_storable_energy -= miner['power'] - generated_energy
+            else:
+                time_mining = (effectively_storable_energy + generated_energy) / miner['power']
+                generated_rub.append(profit_per_hour * time_mining)
+                effectively_storable_energy = 0
+
+    return sum(generated_rub)
+
+
+# Strategy that powers on secondary miner only when battery is full
+def calc_profit_with_secondary_miner_2(energy_gen_by_hour, solar_kw, battery_kwh, miner, secondary_miner):
+    effectively_storable_energy = 0
+    generated_rub = []
+    profit_per_hour = miner['hashrate'] * usd_perhash_per24h * dollar_price / 24
+    sec_profit_per_hour = secondary_miner['hashrate'] * usd_perhash_per24h * dollar_price / 24
+    for energy in energy_gen_by_hour:
+        # рассчет энергии идёт для солнечных панелей номиналом 1квт,
+        # если у нас больше/меньше то необходимо включать множитель
+        generated_energy = energy * solar_kw
+
+        if generated_energy > miner['power'] and effectively_storable_energy > battery_kwh + generated_energy - miner['power']:
+            effectively_storable_energy += (generated_energy - miner['power']) * battery_efficiency
+            excess = effectively_storable_energy - battery_kwh
+            effectively_storable_energy = battery_kwh
+
+            if excess > secondary_miner['power']:
+                generated_rub.append(profit_per_hour + sec_profit_per_hour)
+            else:
+                secondary_miner_profit = secondary_miner['power'] / excess * sec_profit_per_hour
+                generated_rub.append(profit_per_hour + secondary_miner_profit)
+        elif generated_energy > miner['power']:
+            generated_rub.append(profit_per_hour)
+            effectively_storable_energy += (generated_energy - miner['power']) * battery_efficiency
+        elif effectively_storable_energy + generated_energy > miner['power']:
+            generated_rub.append(profit_per_hour)
+            effectively_storable_energy -= miner['power'] - generated_energy
+        else:
+            miner_utilization = (effectively_storable_energy + generated_energy) / miner['power']
+            generated_rub.append(miner_utilization * profit_per_hour)
+            effectively_storable_energy = 0
+
+
+    return sum(generated_rub)
+
+
+def find_best_payback(minkW, maxkW, minkWh, maxkWh, steps, secondary_miner = None):
     min_payback = 100
     min_payback_profit = 0
     best_miner = 0
@@ -167,8 +244,13 @@ def find_best_payback(minkW, maxkW, minkWh, maxkWh, steps):
             for j in range(steps):
                 solar_kW = i * kW_step + minkW
                 battery_kWh = j * kWh_step + minkWh
-                price = miner['price'] + kW_price_rub * solar_kW + kWh_battery_price_rub * battery_kWh + max_11kW_inverter_price_rub + bms_price_rub
-                profit = calc_profit_for_year(energy_profile, solar_kW, battery_kWh, miner)
+                inverter_price = math.ceil(solar_kW / 6) * max_6kW_inverter_price_rub
+                price = miner['price'] + kW_price_rub * solar_kW + kWh_battery_price_rub * battery_kWh + inverter_price + bms_price_rub
+                if secondary_miner == None:
+                    profit = calc_profit_for_year(energy_profile, solar_kW, battery_kWh, miner)
+                else:
+                    price += secondary_miner['price']
+                    profit = calc_profit_with_secondary_miner_2(energy_profile, solar_kW, battery_kWh, miner, secondary_miner)
 
                 if profit != 0:
                     payback_years[i].append(price / profit)
@@ -182,11 +264,23 @@ def find_best_payback(minkW, maxkW, minkWh, maxkWh, steps):
                     payback_years[i].append(100)
 
     print(f"Best miner: {best_miner['name']}, payback years: {min_payback}, solar kW: {minkW + max_roi_i * kW_step}, battery kWh: {minkWh + max_roi_j * kWh_step}")
-    solar_price = kW_price_rub * (max_roi_i * kW_step + minkW)
-    battery_price = kWh_battery_price_rub * (j * kWh_step + minkWh)
-    total_price = best_miner['price'] + solar_price + battery_price + max_11kW_inverter_price_rub + bms_price_rub
-    print(f"System price: {total_price}, profit/y: {min_payback_profit}, miner cost: {best_miner['price']}"
-          f", solar cost: {solar_price}, battery cost: {battery_price}, invertor cost: {max_11kW_inverter_price_rub}"
-          f", bms cost: {bms_price_rub}")
+    solar_kW = max_roi_i * kW_step + minkW
+    solar_price = kW_price_rub * solar_kW
+    battery_price = kWh_battery_price_rub * (max_roi_j * kWh_step + minkWh)
+    inverter_price = math.ceil(solar_kW / 6) * max_6kW_inverter_price_rub
+    if secondary_miner == None:
+        total_price = best_miner['price'] + solar_price + battery_price + inverter_price + bms_price_rub
+        print(f"System price: {total_price}, profit/y: {min_payback_profit}, miner cost: {best_miner['price']}"
+              f", solar cost: {solar_price}, battery cost: {battery_price}, invertor cost: {inverter_price}"
+              f", bms cost: {bms_price_rub}")
+    else:
+        total_price = best_miner['price'] + secondary_miner['price'] + solar_price + battery_price + inverter_price + bms_price_rub
+        print(f"System price: {total_price}, profit/y: {min_payback_profit}, miner cost: {best_miner['price']}"
+              f", solar cost: {solar_price}, battery cost: {battery_price}, invertor cost: {inverter_price}"
+              f", bms cost: {bms_price_rub}, secondary miner cost: {secondary_miner['price']}")
 
-find_best_payback(5, 50, 5, 50, 20)
+
+# кароче с текущими ценами и профитами эта хуёвина держится в районе 14% годовых максимум
+# это чуть меньше x2 каждые 5 лет при сложном проценте
+# считаю более выгодным держать деньги в ликвидной крипте, чем в неликвидной солнечной станции
+find_best_payback(5, 50, 1, 50, 20, miners[2])
