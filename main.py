@@ -100,25 +100,16 @@ def hourly_energy_approximation(
 
         # 4. Расчет энергии для солнечных и облачных дней
         # Энергия на один час
-        monthly_energy_per_hour = monthly_energy / (
-                    n_sunny * daylight + (n_days - n_sunny) * daylight * cloud_efficiency)
-        sunny_effective_hours = n_sunny * daylight
-        cloudy_effective_hours = (n_days - n_sunny) * daylight * cloud_efficiency
-        energy_per_sunny_hour = (monthly_energy - monthly_energy_per_hour * cloudy_effective_hours) / sunny_effective_hours
+        month_multiplicator = monthly_energy / energy_generated_per_month[0]
 
-        print(f"monthly_energy_per_hour = {round(monthly_energy_per_hour, 2)}, sun_hours = {round(n_sunny*daylight, 0)}"
+        print(f"month_multiplicator = {round(month_multiplicator, 2)}, sun_hours = {round(n_sunny*daylight, 0)}"
               f", cloud_hours = {round((n_days - n_sunny) * daylight, 0)},"
               f" effective hours = {round(n_sunny * daylight + (n_days - n_sunny) * daylight * cloud_efficiency, 0)}"
               f" energy = {monthly_energy}")
 
         # Для каждого дня в месяце
         for day in range(n_days):
-            day_profile = sun_energy_profile * energy_per_sunny_hour
-
-            # Для каждого пасмурного часа уменьшаем значение сгенерированной энергии
-            for hour in range(24):
-                if not sunny_hour_flags[hour + day * 24]:
-                    day_profile[hour] = day_profile[hour] * cloud_efficiency
+            day_profile = sun_energy_profile * month_multiplicator
             # Добавляем профиль дня к результату
             start_idx = day_start_index + day * 24
             end_idx = start_idx + 24
