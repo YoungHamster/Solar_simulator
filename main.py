@@ -19,7 +19,7 @@ max_6kW_inverter_price_rub = 35707
 max_11kW_inverter_price_rub = 96328
 
 # profit/h исчисляется в долларах
-miners = [{'name': 'antminer s21', 'price': 192000, 'power': 3.5, 'hashrate': 200},
+miners = [{'name': 'antminer s21', 'price': 101000, 'power': 3.5, 'hashrate': 200},
           #{'name':'antminer s19k pro', 'price':80000, 'power':2.8, 'profit/h':0.2979},
           #{'name':'antminer s19 100th', 'price':31800, 'power':3.25, 'profit/h':0.2487},
           #{'name':'antminer z15 pro', 'price':190650, 'power':2.7, 'profit/h':0.4333},
@@ -147,6 +147,7 @@ def calc_profit_for_year(energy_gen_by_hour, solar_kw, battery_kwh, miner):
 
 def find_best_payback(minkW, maxkW, minkWh, maxkWh, steps):
     min_payback = 100
+    min_payback_profit = 0
     best_miner = 0
     max_roi_i = 0
     max_roi_j = 0
@@ -157,8 +158,6 @@ def find_best_payback(minkW, maxkW, minkWh, maxkWh, steps):
         energy_generated_per_month,
         solar_day_length_avg
     )
-    np.set_printoptions(threshold=sys.maxsize)
-    print(energy_profile)
     kW_step = (maxkW - minkW) / steps
     kWh_step = (maxkWh - minkWh) / steps
 
@@ -168,21 +167,26 @@ def find_best_payback(minkW, maxkW, minkWh, maxkWh, steps):
             for j in range(steps):
                 solar_kW = i * kW_step + minkW
                 battery_kWh = j * kWh_step + minkWh
-                price = miners[0]['price'] + kW_price_rub * solar_kW + kWh_battery_price_rub * battery_kWh
-                profit = calc_profit_for_year(energy_profile, i, j, miner)
+                price = miner['price'] + kW_price_rub * solar_kW + kWh_battery_price_rub * battery_kWh + max_11kW_inverter_price_rub + bms_price_rub
+                profit = calc_profit_for_year(energy_profile, solar_kW, battery_kWh, miner)
+
                 if profit != 0:
                     payback_years[i].append(price / profit)
+                    if payback_years[i][j] < min_payback:
+                        max_roi_i = i
+                        max_roi_j = j
+                        best_miner = miner
+                        min_payback = payback_years[i][j]
+                        min_payback_profit = profit
                 else:
                     payback_years[i].append(100)
-                    print(f"Profit = 0 for miner {miner['name']}, kW: {solar_kW}, kWh: {battery_kWh}")
-
-        for i in range(steps):
-            for j in range(steps):
-                if payback_years[i][j] < min_payback:
-                    max_roi_i = i
-                    max_roi_j = j
-                    best_miner = miner
 
     print(f"Best miner: {best_miner['name']}, payback years: {min_payback}, solar kW: {minkW + max_roi_i * kW_step}, battery kWh: {minkWh + max_roi_j * kWh_step}")
+    solar_price = kW_price_rub * (max_roi_i * kW_step + minkW)
+    battery_price = kWh_battery_price_rub * (j * kWh_step + minkWh)
+    total_price = best_miner['price'] + solar_price + battery_price + max_11kW_inverter_price_rub + bms_price_rub
+    print(f"System price: {total_price}, profit/y: {min_payback_profit}, miner cost: {best_miner['price']}"
+          f", solar cost: {solar_price}, battery cost: {battery_price}, invertor cost: {max_11kW_inverter_price_rub}"
+          f", bms cost: {bms_price_rub}")
 
-find_best_payback(5, 30, 2, 30, 10)
+find_best_payback(5, 50, 5, 50, 20)
